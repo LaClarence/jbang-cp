@@ -29,6 +29,15 @@ jbang cp.java [options] <source> <target>
 - `jbang cp.java -v file1 file2` : verbose copy
 - `jbang cp.java -T -r dir1 dir2` : recursive copy with timing
 
+## Version 1.0.2
+
+- Parallélisme modernisé : utilisation de `CompletableFuture.runAsync(..., executor)` avec `Executors.newVirtualThreadPerTaskExecutor()` (virtual threads) et `CompletableFuture.allOf(...).join()` pour attendre les tâches.
+- Propagation d'erreurs non-checkées : les opérations asynchrones utilisent un wrapper `copyUnchecked(...)` qui lance `UncheckedIOException` pour propager les erreurs I/O hors des Runnable/Callable.
+- `copyDirectory` et `copyFile` utilisent désormais des exceptions non-checkées (`UncheckedIOException` ou `RuntimeException`) pour simplifier la gestion des erreurs côté appelant.
+- Les `IOException` survenues lors de `Files.walkFileTree` sont enveloppées en `UncheckedIOException`; les causes inattendues des `CompletableFuture` sont re-propagées en `RuntimeException`.
+- Gestion d'erreur centralisée : `call()` attrape une `RuntimeException` unique et utilise un `switch` par type (pattern matching) pour distinguer les erreurs I/O et autres, avec sortie et trace conditionnelle via l'option `-v`.
+- Petites améliorations : ajout de la méthode `printError(...)` pour factoriser l'affichage des erreurs, préservation de `Files.copy(...)` (avec `StandardCopyOption`).
+
 ## Version 1.0.1
 
 - Regroupement des options dans une classe imbriquée `Arguments` remplie par Picocli via `@Mixin`, permettant une séparation claire entre parsing et logique métier.

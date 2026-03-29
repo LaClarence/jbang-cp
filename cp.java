@@ -14,25 +14,34 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.function.Supplier;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.logging.Level;
+import java.io.PrintStream;
+import java.io.StringWriter;
+import java.io.PrintWriter;
+import java.io.UncheckedIOException;
 
 @Command(name = "cp", mixinStandardHelpOptions = true, version = {
-    "cp 1.0.1",
+    "cp 1.0.2",
     "Java 26 implementation",
     "CopyLeft 2026"
 }, description = "Copy files and directories")
 public final class cp implements Callable<Integer> {
+
+  private static final int COPY_PERFORMED = 0;
+  private static final int COPY_FAILED = 2;
 
   private static record TimingContext(boolean showTime, Instant start) {
     static TimingContext create(boolean showTime) {
       return new TimingContext(showTime, showTime ? Instant.now() : null);
     }
 
-    void after() {
+    void after(Printer printer) {
       if (showTime && start != null) {
         var elapsed = Duration.between(start, Instant.now());
-        System.out.printf("Elapsed time: %s%n", formatDuration(elapsed));
+        printer.log(() -> new LogEvent(Level.INFO, "Elapsed time: " + formatDuration(elapsed)));
       }
     }
   }
@@ -79,15 +88,59 @@ public final class cp implements Callable<Integer> {
   @Mixin
   private Arguments arguments;
 
-  @Override
-  public Integer call() throws Exception {
-    var context = TimingContext.create(arguments.showTime);
-    performCopy();
-    context.after();
-    return 0;
+  private static final PrintStream Logger = System.out;
+
+  private Printer printer = _ -> {
+    // empty implementation for non-verbose mode
+  };
+
+  private static record LogEvent(Level level, String msg) {
   }
 
-  private void performCopy() throws IOException {
+  @FunctionalInterface
+  private static interface Printer {
+    void log(Supplier<LogEvent> event);
+  }
+
+  @Override
+  public Integer call() {
+    var context = TimingContext.create(arguments.showTime);
+    // initialize printer strategy based on verbose flag (use lambdas)
+    if (arguments.verbose) {
+      this.printer = evt -> {
+        LogEvent e = evt.get();
+        Logger.println(e.msg());
+      };
+    }
+    try {
+      performCopy();
+      context.after(printer);
+      return COPY_PERFORMED;
+    } catch (RuntimeException uex) {
+      printError(uex);
+      return COPY_FAILED;
+    }
+  }
+
+  private void printError(RuntimeException uex) {
+    String header = switch (uex) {
+      case UncheckedIOException _ -> "I/O error: ";
+      default -> "Error: ";
+    };
+    Throwable c = uex.getCause();
+    printer.log(() -> new LogEvent(Level.SEVERE, header + (c == null ? uex.getMessage() : c.getMessage())));
+    if (arguments.verbose && c != null) {
+      printer.log(() -> new LogEvent(Level.SEVERE, formatStackTrace(c)));
+    }
+  }
+
+  private static String formatStackTrace(Throwable throwable) {
+    var sw = new StringWriter();
+    throwable.printStackTrace(new PrintWriter(sw));
+    return sw.toString();
+  }
+
+  private void performCopy() {
     if (Files.isDirectory(arguments.source)) {
       if (!arguments.recursive) {
         throw new IllegalArgumentException("Source is a directory (use -r)");
@@ -105,32 +158,38 @@ public final class cp implements Callable<Integer> {
    * @param dst the destination file
    * @throws IOException
    */
-  void copyFile(Path src, Path dst) throws IOException {
+  void copyFile(Path src, Path dst) {
     if (Files.exists(dst)) {
       if (Files.isRegularFile(src) && Files.isRegularFile(dst)) {
-        long mismatch = Files.mismatch(src, dst);
-        if (mismatch == -1L) {
-          if (arguments.verbose) {
-            System.out.println("skip (identical) " + dst);
+        try {
+          long mismatch = Files.mismatch(src, dst);
+          if (mismatch == -1L) {
+            printer.log(() -> new LogEvent(Level.INFO, "skip (identical) " + dst));
+            return;
           }
-          return;
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
         }
       }
       if (arguments.noClobber) {
-        if (arguments.verbose) {
-          System.out.println("skip " + dst);
-        }
+        printer.log(() -> new LogEvent(Level.INFO, "skip " + dst));
         return;
       }
       if (!arguments.force) {
-        throw new FileAlreadyExistsException(dst.toString());
+        throw new UncheckedIOException(new FileAlreadyExistsException(dst.toString()));
       }
     }
-    Files.copy(src, dst,
-        StandardCopyOption.REPLACE_EXISTING,
-        StandardCopyOption.COPY_ATTRIBUTES);
-    if (arguments.verbose) {
-      System.out.println(src + " -> " + dst);
+    copyUnchecked(src, dst);
+    printer.log(() -> new LogEvent(Level.INFO, src + " -> " + dst));
+  }
+
+  private static void copyUnchecked(Path src, Path dst) {
+    try {
+      Files.copy(src, dst,
+          StandardCopyOption.REPLACE_EXISTING,
+          StandardCopyOption.COPY_ATTRIBUTES);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
   }
 
@@ -141,47 +200,51 @@ public final class cp implements Callable<Integer> {
    * @param dst the destination directory
    * @throws IOException
    */
-  void copyDirectory(Path src, Path dst) throws IOException {
-    List<Future<?>> futures = new ArrayList<>();
+  void copyDirectory(Path src, Path dst) {
+    List<CompletableFuture<Void>> futures = new ArrayList<>();
     try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-      Files.walkFileTree(src, new SimpleFileVisitor<>() {
-        @Override
-        public FileVisitResult preVisitDirectory(Path dir,
-            BasicFileAttributes attrs)
-            throws IOException {
-          Path targetDir = dst.resolve(src.relativize(dir));
-          Files.createDirectories(targetDir);
-          if (arguments.verbose) {
-            System.out.println("dir  " + dir + " -> " + targetDir);
+      try {
+        Files.walkFileTree(src, new SimpleFileVisitor<>() {
+          @Override
+          public FileVisitResult preVisitDirectory(Path dir,
+              BasicFileAttributes attrs)
+              throws IOException {
+            Path targetDir = dst.resolve(src.relativize(dir));
+            Files.createDirectories(targetDir);
+            printer.log(() -> new LogEvent(Level.INFO, "dir  " + dir + " -> " + targetDir));
+            return FileVisitResult.CONTINUE;
           }
-          return FileVisitResult.CONTINUE;
-        }
 
-        @Override
-        public FileVisitResult visitFile(Path file,
-            BasicFileAttributes attrs)
-            throws IOException {
-          Path destFile = dst.resolve(src.relativize(file));
-          futures.add(executor.submit(() -> {
-            copyFile(file, destFile);
-            return null;
-          }));
-          return FileVisitResult.CONTINUE;
-        }
-      });
+          @Override
+          public FileVisitResult visitFile(Path file,
+              BasicFileAttributes attrs)
+              throws IOException {
+            Path destFile = dst.resolve(src.relativize(file));
 
-      for (Future<?> future : futures) {
-        try {
-          future.get();
-        } catch (ExecutionException e) {
-          if (e.getCause() instanceof IOException ioEx) {
-            throw ioEx;
+            futures.add(CompletableFuture.runAsync(() -> copyUnchecked(file, destFile), executor));
+
+            return FileVisitResult.CONTINUE;
           }
-          throw new IOException(e);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          throw new IOException(e);
+        });
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+
+      CompletableFuture<?>[] cfs = futures.toArray(new CompletableFuture[0]);
+      try {
+        CompletableFuture.allOf(cfs).join();
+      } catch (CompletionException e) {
+        Throwable c = e.getCause();
+        while (c instanceof CompletionException && c.getCause() != null) {
+          c = c.getCause();
         }
+        if (c instanceof UncheckedIOException uio) {
+          throw uio;
+        }
+        if (c instanceof IOException ioEx) {
+          throw new UncheckedIOException(ioEx);
+        }
+        throw new RuntimeException(c);
       }
     }
   }
